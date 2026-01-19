@@ -1,9 +1,13 @@
 import numpy as np
 import warp as wp
 
+
+
 #TODO: loss is not representative of all frames
 #TODO: i think the gradient is breaking when i call numpy
 #TODO: what is the proper way of handling all the kernels; when is something a kernel; when does something need to include requires_grad?
+#TODO: look into what synchronize is + how autograd actually works
+
 
 from forward import (
     W, H, SPACE_DELTA, DT, STEPS, G, MASS, USE_DIAGONALS, DEVICE,
@@ -20,6 +24,27 @@ gt_all = wp.array(gt_np, dtype=wp.vec2, device=DEVICE)
 #free_mask_np = (1 - np.array(pins)).astype(np.float32)
 #mask_d = wp.array(free_mask_np, dtype=float, device=DEVICE)
 
+import os, sys, faulthandler
+faulthandler.enable()                 # dumps Python stack on SIGSEGV
+os.environ["PYTHONFAULTHANDLER"] = "1"
+
+def mark(msg):
+    print(msg)
+    sys.stdout.flush()
+
+def try_launch(name, fn, dim, inputs):
+    mark(f"→ {name} dim={dim}")
+    wp.launch(fn, dim=dim, inputs=inputs, device=DEVICE)
+    mark(f"done {name}")
+
+@wp.kernel
+def make_params(log_k: wp.array(dtype=wp.float32),
+                log_c: wp.array(dtype=wp.float32),
+                K:     wp.array(dtype=wp.float32),
+                C:     wp.array(dtype=wp.float32)):
+    # single-thread kernel (dim=1). Warp will build a backward kernel automatically.
+    K[0] = wp.exp(log_k[0])
+    C[0] = wp.exp(log_c[0])
 
 @wp.kernel
 def mse_kernel(pos: wp.array(dtype=wp.vec2),
@@ -39,6 +64,8 @@ def exp_kernel(input: wp.array(dtype=wp.float32), output: wp.array(dtype=wp.floa
 def rollout_and_loss(gt_all: wp.array, log_k: wp.array, log_c: wp.array):
     #clean up later so everything except pos and vel get set up outside of this func
     pos, vel, edges, rest, pins, masses, forces = setup_data()
+
+    #TODO: probabaly move these to estimate_params later
     particle_count = pos.shape[0]
     frame_count = gt_all.shape[0]
     norm_div = float(particle_count * frame_count)
@@ -48,28 +75,25 @@ def rollout_and_loss(gt_all: wp.array, log_k: wp.array, log_c: wp.array):
     C_arr = wp.zeros(1, dtype=wp.float32, device=DEVICE, requires_grad=True)
 
     #deal with getting the log version of k and c back to 
-    wp.launch(exp_kernel, dim=1, inputs=[log_k, K_arr], device=DEVICE)
-    wp.launch(exp_kernel, dim=1, inputs=[log_c, C_arr], device=DEVICE)
+    try_launch(f"launching logk and logc", make_params, dim=1, inputs=[log_k, log_c, K_arr, C_arr])
 
     for frame in range(frame_count):
-        wp.launch(zero_vec2, dim=particle_count, inputs=[forces], device=DEVICE)
+        try_launch(f"zero_vec2 frame={frame}", zero_vec2, dim=particle_count, inputs=[forces])
+
         # Calculate spring forces
-        wp.launch(spring_forces, dim=edges.shape[0], 
-                 inputs=[pos, edges, rest, K_arr, forces], device=DEVICE)
-        
+        try_launch(f"spring_forces frame={frame}", spring_forces, dim=edges.shape[0], inputs=[pos, edges, rest, K_arr, forces])
+
         # Calculate damping forces
-        wp.launch(damping_forces, dim=particle_count, 
-                 inputs=[vel, C_arr, forces], device=DEVICE)
+        try_launch(f"damping_forces frame={frame}", damping_forces, dim=particle_count, inputs=[vel, C_arr, forces])
         
         # Integrate positions and velocities
-        wp.launch(integrate, dim=particle_count, 
-                 inputs=[pos, vel, forces, masses, pins, float(G), float(DT)], 
-                 device=DEVICE)
+        try_launch(f"integrate frame={frame}", integrate, dim=particle_count, inputs=[pos, vel, forces, masses, pins, float(G), float(DT)])
 
         #apparently doing gt_all[frame] gives a view; might be causing errors
         #wp.launch(mse_kernel, dim=particle_count, inputs=[pos, gt_all[frame], norm_div, loss], device=DEVICE)
-
-        wp.launch(mse_kernel, dim=particle_count, inputs=[pos, gt_all[frame], norm_div, loss], device=DEVICE)
+        target_np = gt_all.numpy()[frame]
+        curr_frame_pos = wp.array(target_np, dtype=wp.vec2, device=DEVICE)
+        try_launch(f"mse_kernel frame={frame}", mse_kernel, dim=particle_count, inputs=[pos, curr_frame_pos, norm_div, loss])
 
     return loss
 
@@ -77,12 +101,13 @@ def rollout_and_loss(gt_all: wp.array, log_k: wp.array, log_c: wp.array):
 def estimate_params():
     log_k = wp.array([np.log(100.0)], dtype=wp.float32, requires_grad=True, device=DEVICE)
     log_c = wp.array([np.log(0.01)], dtype=wp.float32, requires_grad=True, device=DEVICE)
-    
+
     epochs: int = 100
     lr_k: float = 1e-3
     lr_c: float = 1e-3
 
     for epoch in range(epochs):
+        print(epoch)
         with wp.Tape() as tape:
             loss = rollout_and_loss(gt_all, log_k, log_c)
         tape.backward(loss)
@@ -98,7 +123,6 @@ def estimate_params():
         # re-wrap as fresh autodiff tensors for next epoch
         log_k = wp.array([float(new_log_k)], dtype=wp.float32, device=DEVICE, requires_grad=True)
         log_c = wp.array([float(new_log_c)], dtype=wp.float32, device=DEVICE, requires_grad=True)
-
 
         if (epoch % 5) == 0 or epoch == epochs - 1:
             print(f"epoch {epoch:03d} | loss={loss.numpy()[0]:.6e} | K={np.exp(new_log_k):.4f} | C={np.exp(new_log_c):.6f} | gK={gk:.3e} gC={gc:.3e}")
